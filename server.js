@@ -11,8 +11,20 @@ let db
 const MONGODB_URI = process.env.MONGODB_URI
 const PROCESSOR_SECRET_KEY = process.env.PROCESSOR_SECRET_KEY || "default-secret"
 
+if (!MONGODB_URI) {
+  console.error("❌ MONGODB_URI environment variable is required")
+  process.exit(1)
+}
+
 // Connect to MongoDB
-MongoClient.connect(MONGODB_URI)
+MongoClient.connect(MONGODB_URI, {
+  connectTimeoutMS: 30000,
+  socketTimeoutMS: 45000,
+  serverSelectionTimeoutMS: 60000,
+  maxPoolSize: 10,
+  minPoolSize: 5,
+  maxIdleTimeMS: 120000,
+})
   .then((client) => {
     console.log("✅ Connected to MongoDB")
     db = client.db("instaautodm")
@@ -27,7 +39,11 @@ app.use(bodyParser.json())
 
 // Health check
 app.get("/", (req, res) => {
-  res.json({ status: "Automation processor is running", timestamp: new Date() })
+  res.json({
+    status: "Automation processor is running",
+    timestamp: new Date(),
+    mongodb: db ? "connected" : "disconnected",
+  })
 })
 
 // Process webhook data forwarded from Vercel
@@ -36,17 +52,39 @@ app.post("/process-webhook", async (req, res) => {
     // Verify authorization
     const authHeader = req.headers.authorization
     if (!authHeader || authHeader !== `Bearer ${PROCESSOR_SECRET_KEY}`) {
+      console.log("❌ Unauthorized request")
       return res.status(401).json({ error: "Unauthorized" })
+    }
+
+    if (!db) {
+      console.log("❌ Database not connected")
+      return res.status(500).json({ error: "Database not connected" })
     }
 
     const webhookData = req.body
     console.log("📨 Processing webhook data:", JSON.stringify(webhookData, null, 2))
 
+    // Update webhook log as processed
+    try {
+      await db.collection("webhook_logs").updateOne(
+        { "data.entry.0.id": webhookData.entry?.[0]?.id },
+        {
+          $set: {
+            processed: true,
+            processedAt: new Date(),
+            processorResponse: "Processing started",
+          },
+        },
+      )
+    } catch (logError) {
+      console.error("❌ Error updating webhook log:", logError)
+    }
+
     if (webhookData.object === "instagram" && webhookData.entry) {
       await processWebhookEntries(webhookData.entry)
     }
 
-    res.json({ success: true, message: "Webhook processed" })
+    res.json({ success: true, message: "Webhook processed successfully" })
   } catch (error) {
     console.error("💥 Webhook processing error:", error)
     res.status(500).json({ error: error.message })
@@ -170,6 +208,7 @@ async function processMessageAutomation(instagramId, messageData) {
     console.log(`🔍 Found ${automations.length} active message automations`)
 
     if (automations.length === 0) {
+      console.log("ℹ️ No active message automations found")
       return
     }
 
@@ -200,6 +239,8 @@ async function processMessageAutomation(instagramId, messageData) {
             "message",
           )
           console.log("🎉 Message automation completed successfully!")
+        } else {
+          console.error("❌ Message automation failed:", result.error)
         }
         break
       }
@@ -225,6 +266,7 @@ async function processCommentAutomation(instagramId, commentData) {
     console.log(`🔍 Found ${automations.length} active comment automations`)
 
     if (automations.length === 0) {
+      console.log("ℹ️ No active comment automations found")
       return
     }
 
@@ -267,6 +309,8 @@ async function processCommentAutomation(instagramId, commentData) {
             },
           )
           console.log("🎉 Comment automation completed successfully!")
+        } else {
+          console.error("❌ Comment automation failed:", result.error)
         }
         break
       }
@@ -278,6 +322,8 @@ async function processCommentAutomation(instagramId, commentData) {
 
 async function sendDirectMessage(instagramId, recipientId, message) {
   try {
+    console.log(`📤 Sending direct message to ${recipientId}: "${message}"`)
+
     const account = await db.collection("accounts").findOne({ instagramId })
 
     if (!account?.accessToken) {
@@ -300,7 +346,7 @@ async function sendDirectMessage(instagramId, recipientId, message) {
     const responseData = await response.json()
 
     if (response.ok) {
-      console.log("✅ Direct message sent successfully")
+      console.log("✅ Direct message sent successfully:", responseData.id)
       return { success: true, messageId: responseData.id }
     } else {
       console.error("❌ Failed to send direct message:", responseData)
@@ -314,6 +360,8 @@ async function sendDirectMessage(instagramId, recipientId, message) {
 
 async function replyToComment(commentId, replyMessage, instagramId) {
   try {
+    console.log(`💬 Replying to comment ${commentId}: "${replyMessage}"`)
+
     const account = await db.collection("accounts").findOne({ instagramId })
 
     if (!account?.accessToken) {
@@ -336,7 +384,7 @@ async function replyToComment(commentId, replyMessage, instagramId) {
     const responseData = await response.json()
 
     if (response.ok) {
-      console.log("✅ Comment reply sent successfully")
+      console.log("✅ Comment reply sent successfully:", responseData.id)
       return { success: true, replyId: responseData.id }
     } else {
       console.error("❌ Failed to reply to comment:", responseData)
@@ -367,6 +415,18 @@ async function logAutomationTrigger(automation, instagramId, triggeredBy, trigge
   }
 }
 
+// Graceful shutdown
+process.on("SIGTERM", () => {
+  console.log("🛑 SIGTERM received, shutting down gracefully")
+  process.exit(0)
+})
+
+process.on("SIGINT", () => {
+  console.log("🛑 SIGINT received, shutting down gracefully")
+  process.exit(0)
+})
+
 app.listen(PORT, () => {
   console.log(`🚀 Automation processor running on port ${PORT}`)
+  console.log(`📊 Health check available at: http://localhost:${PORT}`)
 })
