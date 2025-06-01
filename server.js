@@ -1,30 +1,35 @@
 const express = require("express")
-const bodyParser = require("body-parser")
 const { MongoClient } = require("mongodb")
+const cron = require("node-cron")
+const cors = require("cors")
+const helmet = require("helmet")
 require("dotenv").config()
 
 const app = express()
 const PORT = process.env.PORT || 3000
 
+// Middleware
+app.use(helmet())
+app.use(cors())
+app.use(express.json({ limit: "10mb" }))
+
 // MongoDB connection
 let db
 const MONGODB_URI = process.env.MONGODB_URI
-const PROCESSOR_SECRET_KEY = process.env.PROCESSOR_SECRET_KEY || "default-secret"
+const RENDER_SERVER_SECRET = process.env.RENDER_SERVER_SECRET
 
 if (!MONGODB_URI) {
   console.error("❌ MONGODB_URI environment variable is required")
   process.exit(1)
 }
 
+if (!RENDER_SERVER_SECRET) {
+  console.error("❌ RENDER_SERVER_SECRET environment variable is required")
+  process.exit(1)
+}
+
 // Connect to MongoDB
-MongoClient.connect(MONGODB_URI, {
-  connectTimeoutMS: 30000,
-  socketTimeoutMS: 45000,
-  serverSelectionTimeoutMS: 60000,
-  maxPoolSize: 10,
-  minPoolSize: 5,
-  maxIdleTimeMS: 120000,
-})
+MongoClient.connect(MONGODB_URI)
   .then((client) => {
     console.log("✅ Connected to MongoDB")
     db = client.db("instaautodm")
@@ -34,60 +39,93 @@ MongoClient.connect(MONGODB_URI, {
     process.exit(1)
   })
 
-// Middleware
-app.use(bodyParser.json())
+// Middleware to verify requests
+const verifyAuth = (req, res, next) => {
+  const authHeader = req.headers.authorization
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "Unauthorized" })
+  }
 
-// Health check
-app.get("/", (req, res) => {
+  const token = authHeader.substring(7)
+  if (token !== RENDER_SERVER_SECRET) {
+    return res.status(401).json({ error: "Invalid token" })
+  }
+
+  next()
+}
+
+// Health check endpoint
+app.get("/health", (req, res) => {
   res.json({
-    status: "Automation processor is running",
-    timestamp: new Date(),
-    mongodb: db ? "connected" : "disconnected",
+    status: "healthy",
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
   })
 })
 
-// Process webhook data forwarded from Vercel
-app.post("/process-webhook", async (req, res) => {
-  try {
-    // Verify authorization
-    const authHeader = req.headers.authorization
-    if (!authHeader || authHeader !== `Bearer ${PROCESSOR_SECRET_KEY}`) {
-      console.log("❌ Unauthorized request")
-      return res.status(401).json({ error: "Unauthorized" })
-    }
+// Keep-alive endpoint (for self-pinging)
+app.get("/ping", (req, res) => {
+  res.json({ pong: true, timestamp: new Date().toISOString() })
+})
 
-    if (!db) {
-      console.log("❌ Database not connected")
-      return res.status(500).json({ error: "Database not connected" })
-    }
+// Webhook processing endpoint
+app.post("/webhook/process", verifyAuth, async (req, res) => {
+  try {
+    console.log("📥 Received webhook for processing:", JSON.stringify(req.body, null, 2))
 
     const webhookData = req.body
-    console.log("📨 Processing webhook data:", JSON.stringify(webhookData, null, 2))
-
-    // Update webhook log as processed
-    try {
-      await db.collection("webhook_logs").updateOne(
-        { "data.entry.0.id": webhookData.entry?.[0]?.id },
-        {
-          $set: {
-            processed: true,
-            processedAt: new Date(),
-            processorResponse: "Processing started",
-          },
-        },
-      )
-    } catch (logError) {
-      console.error("❌ Error updating webhook log:", logError)
-    }
 
     if (webhookData.object === "instagram" && webhookData.entry) {
       await processWebhookEntries(webhookData.entry)
+
+      // Log successful processing
+      await logEvent("webhook_processed_on_render", webhookData, true)
+
+      res.json({ success: true, message: "Webhook processed successfully" })
+    } else {
+      res.status(400).json({ error: "Invalid webhook format" })
+    }
+  } catch (error) {
+    console.error("❌ Error processing webhook:", error)
+    await logEvent("webhook_processing_error", { error: error.message }, false, error.message)
+    res.status(500).json({ error: "Internal server error" })
+  }
+})
+
+// Process unprocessed webhooks endpoint
+app.post("/process/pending", verifyAuth, async (req, res) => {
+  try {
+    const pendingEvents = await db
+      .collection("webhook_events")
+      .find({ processed: false })
+      .sort({ createdAt: 1 })
+      .limit(50)
+      .toArray()
+
+    console.log(`📋 Processing ${pendingEvents.length} pending webhook events`)
+
+    for (const event of pendingEvents) {
+      try {
+        if (event.data.object === "instagram" && event.data.entry) {
+          await processWebhookEntries(event.data.entry)
+
+          // Mark as processed
+          await db
+            .collection("webhook_events")
+            .updateOne({ _id: event._id }, { $set: { processed: true, processedAt: new Date() } })
+        }
+      } catch (eventError) {
+        console.error("❌ Error processing event:", eventError)
+        await db
+          .collection("webhook_events")
+          .updateOne({ _id: event._id }, { $set: { error: eventError.message, processedAt: new Date() } })
+      }
     }
 
-    res.json({ success: true, message: "Webhook processed successfully" })
+    res.json({ success: true, processed: pendingEvents.length })
   } catch (error) {
-    console.error("💥 Webhook processing error:", error)
-    res.status(500).json({ error: error.message })
+    console.error("❌ Error processing pending events:", error)
+    res.status(500).json({ error: "Internal server error" })
   }
 })
 
@@ -115,14 +153,9 @@ async function processWebhookEntries(entries) {
           }
         }
       }
-
-      // Handle direct field access (alternative structure)
-      if (entry.field === "comments" || entry.field === "live_comments") {
-        console.log("🔄 Processing direct field webhook")
-        await handleComment(instagramId, entry.value)
-      }
     } catch (entryError) {
       console.error("❌ Error processing entry:", entryError)
+      await logEvent("entry_processing_error", { entry, error: entryError.message }, false, entryError.message)
     }
   }
 }
@@ -149,16 +182,17 @@ async function handleMessage(instagramId, message) {
       processed: false,
     }
 
-    // Store message in database
     const result = await db.collection("messages").insertOne(messageData)
     console.log("📥 Message stored with ID:", result.insertedId)
 
-    // Process automation immediately
+    await logEvent("message_stored", { messageId: result.insertedId, text: messageData.text })
+
     if (messageData.text) {
       await processMessageAutomation(instagramId, { ...messageData, _id: result.insertedId })
     }
   } catch (error) {
     console.error("❌ Error handling message:", error)
+    await logEvent("message_handling_error", { message, error: error.message }, false, error.message)
   }
 }
 
@@ -166,6 +200,7 @@ async function handleComment(instagramId, commentValue) {
   try {
     console.log("💬 Processing comment:", JSON.stringify(commentValue, null, 2))
 
+    // Handle both Facebook Login and Business Login formats
     const commentData = {
       instagramId,
       commentId: commentValue.id || commentValue.comment_id || `comment_${Date.now()}`,
@@ -179,16 +214,21 @@ async function handleComment(instagramId, commentValue) {
       isProcessed: false,
     }
 
-    // Store comment in database
     const result = await db.collection("comments").insertOne(commentData)
     console.log("📥 Comment stored with ID:", result.insertedId)
 
-    // Process automation immediately
+    await logEvent("comment_stored", {
+      commentId: result.insertedId,
+      text: commentData.text,
+      username: commentData.username,
+    })
+
     if (commentData.text) {
       await processCommentAutomation(instagramId, { ...commentData, _id: result.insertedId })
     }
   } catch (error) {
     console.error("❌ Error handling comment:", error)
+    await logEvent("comment_handling_error", { commentValue, error: error.message }, false, error.message)
   }
 }
 
@@ -208,7 +248,7 @@ async function processMessageAutomation(instagramId, messageData) {
     console.log(`🔍 Found ${automations.length} active message automations`)
 
     if (automations.length === 0) {
-      console.log("ℹ️ No active message automations found")
+      await logEvent("no_message_automations", { instagramId })
       return
     }
 
@@ -229,6 +269,13 @@ async function processMessageAutomation(instagramId, messageData) {
 
         const result = await sendDirectMessage(instagramId, messageData.senderId, automation.replyMessage)
 
+        await logEvent("automation_triggered", {
+          automationName: automation.name,
+          triggerText: messageData.text,
+          replyMessage: automation.replyMessage,
+          success: result.success,
+        })
+
         if (result.success) {
           await logAutomationTrigger(
             automation,
@@ -238,15 +285,13 @@ async function processMessageAutomation(instagramId, messageData) {
             automation.replyMessage,
             "message",
           )
-          console.log("🎉 Message automation completed successfully!")
-        } else {
-          console.error("❌ Message automation failed:", result.error)
         }
         break
       }
     }
   } catch (error) {
     console.error("❌ Error processing message automation:", error)
+    await logEvent("message_automation_error", { messageData, error: error.message }, false, error.message)
   }
 }
 
@@ -266,7 +311,7 @@ async function processCommentAutomation(instagramId, commentData) {
     console.log(`🔍 Found ${automations.length} active comment automations`)
 
     if (automations.length === 0) {
-      console.log("ℹ️ No active comment automations found")
+      await logEvent("no_comment_automations", { instagramId })
       return
     }
 
@@ -286,6 +331,13 @@ async function processCommentAutomation(instagramId, commentData) {
         console.log(`✅ Triggering comment automation: ${automation.name}`)
 
         const result = await replyToComment(commentData.commentId, automation.replyMessage, instagramId)
+
+        await logEvent("comment_automation_triggered", {
+          automationName: automation.name,
+          triggerText: commentData.text,
+          replyMessage: automation.replyMessage,
+          success: result.success,
+        })
 
         if (result.success) {
           await logAutomationTrigger(
@@ -308,22 +360,18 @@ async function processCommentAutomation(instagramId, commentData) {
               },
             },
           )
-          console.log("🎉 Comment automation completed successfully!")
-        } else {
-          console.error("❌ Comment automation failed:", result.error)
         }
         break
       }
     }
   } catch (error) {
     console.error("❌ Error processing comment automation:", error)
+    await logEvent("comment_automation_error", { commentData, error: error.message }, false, error.message)
   }
 }
 
 async function sendDirectMessage(instagramId, recipientId, message) {
   try {
-    console.log(`📤 Sending direct message to ${recipientId}: "${message}"`)
-
     const account = await db.collection("accounts").findOne({ instagramId })
 
     if (!account?.accessToken) {
@@ -346,7 +394,7 @@ async function sendDirectMessage(instagramId, recipientId, message) {
     const responseData = await response.json()
 
     if (response.ok) {
-      console.log("✅ Direct message sent successfully:", responseData.id)
+      console.log("✅ Direct message sent successfully")
       return { success: true, messageId: responseData.id }
     } else {
       console.error("❌ Failed to send direct message:", responseData)
@@ -360,8 +408,6 @@ async function sendDirectMessage(instagramId, recipientId, message) {
 
 async function replyToComment(commentId, replyMessage, instagramId) {
   try {
-    console.log(`💬 Replying to comment ${commentId}: "${replyMessage}"`)
-
     const account = await db.collection("accounts").findOne({ instagramId })
 
     if (!account?.accessToken) {
@@ -369,7 +415,7 @@ async function replyToComment(commentId, replyMessage, instagramId) {
       return { success: false, error: "No access token" }
     }
 
-    // Use correct Instagram Graph API endpoint for comment replies
+    // Use the correct Instagram Graph API endpoint for comment replies
     const response = await fetch(`https://graph.instagram.com/v19.0/${commentId}/replies`, {
       method: "POST",
       headers: {
@@ -384,7 +430,7 @@ async function replyToComment(commentId, replyMessage, instagramId) {
     const responseData = await response.json()
 
     if (response.ok) {
-      console.log("✅ Comment reply sent successfully:", responseData.id)
+      console.log("✅ Comment reply sent successfully")
       return { success: true, replyId: responseData.id }
     } else {
       console.error("❌ Failed to reply to comment:", responseData)
@@ -415,18 +461,59 @@ async function logAutomationTrigger(automation, instagramId, triggeredBy, trigge
   }
 }
 
-// Graceful shutdown
-process.on("SIGTERM", () => {
-  console.log("🛑 SIGTERM received, shutting down gracefully")
-  process.exit(0)
+async function logEvent(eventType, data, success = true, error) {
+  try {
+    await db.collection("webhook_logs").insertOne({
+      eventType,
+      data,
+      success,
+      error,
+      timestamp: new Date(),
+      createdAt: new Date(),
+      source: "render_server",
+    })
+  } catch (logError) {
+    console.error("Failed to log event:", logError)
+  }
+}
+
+// Self-ping to prevent sleeping (every 14 minutes)
+cron.schedule("*/14 * * * *", async () => {
+  try {
+    const response = await fetch(`${process.env.RENDER_APP_URL || "http://localhost:" + PORT}/ping`)
+    console.log("🏓 Self-ping successful:", response.status)
+  } catch (error) {
+    console.error("❌ Self-ping failed:", error)
+  }
 })
 
-process.on("SIGINT", () => {
-  console.log("🛑 SIGINT received, shutting down gracefully")
-  process.exit(0)
+// Process pending webhooks every minute
+cron.schedule("* * * * *", async () => {
+  try {
+    const pendingCount = await db.collection("webhook_events").countDocuments({ processed: false })
+    if (pendingCount > 0) {
+      console.log(`📋 Found ${pendingCount} pending webhook events, processing...`)
+
+      const response = await fetch(`${process.env.RENDER_APP_URL || "http://localhost:" + PORT}/process/pending`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${RENDER_SERVER_SECRET}`,
+          "Content-Type": "application/json",
+        },
+      })
+
+      if (response.ok) {
+        const result = await response.json()
+        console.log(`✅ Processed ${result.processed} pending events`)
+      }
+    }
+  } catch (error) {
+    console.error("❌ Error in pending webhook processing:", error)
+  }
 })
 
 app.listen(PORT, () => {
-  console.log(`🚀 Automation processor running on port ${PORT}`)
-  console.log(`📊 Health check available at: http://localhost:${PORT}`)
+  console.log(`🚀 Instagram Automation Server running on port ${PORT}`)
+  console.log(`📡 Health check: http://localhost:${PORT}/health`)
+  console.log(`🏓 Ping endpoint: http://localhost:${PORT}/ping`)
 })
